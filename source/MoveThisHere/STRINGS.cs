@@ -26,6 +26,8 @@ namespace MoveThisHere
                     // Remove
                     public static LocString REMOVE = "Remove";
                     public static LocString REMOVE_TOOLTIP = "Remove this hauling point and drop all items here";
+                    public static LocString CANCEL_REMOVE = "Cancel Remove";
+                    public static LocString CANCEL_REMOVE_TOOLTIP = "Cancel the queued deconstruction of this hauling point";
 
                     // Auto-Drop
                     public static LocString AUTO_DROP_ON = "Enable Auto-Drop";

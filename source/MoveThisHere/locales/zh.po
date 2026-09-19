@@ -96,6 +96,16 @@ msgctxt "MoveThisHere.STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.REMOVE_TOOLTIP"
 msgid "Remove this hauling point and drop all items here"
 msgstr "拆除此纸板箱并把纸板箱内的所有物品放在地上"
 
+#. MoveThisHere.STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE
+msgctxt "MoveThisHere.STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE"
+msgid "Cancel Remove"
+msgstr "取消拆除"
+
+#. MoveThisHere.STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE_TOOLTIP
+msgctxt "MoveThisHere.STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE_TOOLTIP"
+msgid "Cancel the queued deconstruction of this hauling point"
+msgstr "取消已排队的手动拆除"
+
 #. MoveThisHere.STRINGS.BUILDINGS.PREFABS.HAULINGPOINT.DESC
 msgctxt "MoveThisHere.STRINGS.BUILDINGS.PREFABS.HAULINGPOINT.DESC"
 msgid ""

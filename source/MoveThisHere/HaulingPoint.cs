@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using STRINGS;
 using Newtonsoft.Json.Linq;
+using TUNING;
 
 namespace MoveThisHere
 {
@@ -150,6 +151,9 @@ namespace MoveThisHere
         {
             willSpill = !willSpill;
 
+            // 倾倒开关变化会影响已排队的手动拆除任务是否仍需要小人
+            // Toggling willSpill affects whether a queued manual deconstruct still needs a duplicant.
+            GetComponent<DeconstructableHaulingPoint>()?.ReevaluateQueuedDeconstruction();
         }
         private void ToggleWillSelfDestruct()
         {
@@ -247,14 +251,13 @@ namespace MoveThisHere
 
         public void Sim1000ms(float dt)
         {
-            if (willSelfDestruct)
-            {
-                if ((AmountStored / userMaxCapacity) >= .99) //give a little wiggle for sublimination, stock margin doesn't work with low mass
-                {
-                    GetComponentInParent<DeconstructableHaulingPoint>().OnDeconstruct();
+            if (!willSelfDestruct) return;
+            if (userMaxCapacity <= 0f) return;                                  // 防止除零
+            if ((AmountStored / userMaxCapacity) < .99f) return;                //give a little wiggle for sublimination, stock margin doesn't work with low mass
 
-                }
-            }
+            // 自动拆除走瞬间路径，小人刚送完货就在附近，不需要再排队操作
+            // Auto-deconstruct uses the instant path: the duplicant just finished delivering and is nearby, no need to queue a chore.
+            GetComponentInParent<DeconstructableHaulingPoint>()?.InstantDeconstruct();
         }
 
     }
@@ -266,13 +269,27 @@ namespace MoveThisHere
         //however it won't drop any resources from the building itself, important because it's made of vacuum and this gives an error
         //also drops gas resource in canister form
 
+        // 手动拆除时创建的小人任务；自动拆除不经过它
+        // Chore created for manual deconstruction; auto-deconstruct does not go through it.
+        private Chore deconstructChore;
+
+        // 累计已工作的时间，用于在 OnWorkTick 里判断完成
+        // Accumulated work time, used to determine completion in OnWorkTick.
+        private float workElapsedTime;
+
+        // 是否已排队手动拆除（用于按钮显示 拆除 / 取消拆除，及防止重复排队）
+        // Whether manual deconstruction is queued (for the Remove / Cancel Remove button, and to prevent double queueing).
+        private bool isMarkedForDeconstruction;
+
         private static readonly EventSystem.IntraObjectHandler<DeconstructableHaulingPoint> OnRefreshUserMenuDelegate = new EventSystem.IntraObjectHandler<DeconstructableHaulingPoint>(delegate (DeconstructableHaulingPoint component, object data)
         {
             component.OnRefreshUserMenu(data);
         });
         private static readonly EventSystem.IntraObjectHandler<DeconstructableHaulingPoint> OnDeconstructDelegate = new EventSystem.IntraObjectHandler<DeconstructableHaulingPoint>(delegate (DeconstructableHaulingPoint component, object data)
         {
-            component.OnDeconstruct();
+            // 原版拆除事件（-790448070）走 RequestDeconstruct，由它按 willSpill 决定是否排队小人
+            // The vanilla deconstruct event (-790448070) goes through RequestDeconstruct, which decides based on willSpill whether to queue a duplicant chore.
+            component.RequestDeconstruct();
         });
         private CellOffset[] placementOffsets
         {
@@ -293,6 +310,28 @@ namespace MoveThisHere
         protected override void OnPrefabInit()
         {
             base.OnPrefabInit();
+
+            // 复制原版 Deconstructable 的配置，让小人播放正确的拆除动画和状态
+            // Copy the vanilla Deconstructable configuration so the duplicant plays the correct deconstruct animation and status.
+            this.faceTargetWhenWorking = true;
+            this.synchronizeAnims = false;
+            this.workerStatusItem = Db.Get().DuplicantStatusItems.Deconstructing;
+            this.attributeConverter = Db.Get().AttributeConverters.ConstructionSpeed;
+            // this.attributeExperienceMultiplier = DUPLICANTSTATS.ATTRIBUTE_LEVELING.MOST_DAY_EXPERIENCE;
+            this.attributeExperienceMultiplier = 0;
+            this.minimumAttributeMultiplier = 0.75f;
+            this.skillExperienceSkillGroup = Db.Get().SkillGroups.Building.Id;
+            this.skillExperienceMultiplier = 0;
+            // this.attributeExperienceMultiplier = DUPLICANTSTATS.ATTRIBUTE_LEVELING.MOST_DAY_EXPERIENCE;
+            this.multitoolContext = "build";
+            this.multitoolHitEffectTag = EffectConfigs.BuildSplashId;
+            this.workingPstComplete = null;
+            this.workingPstFailed = null;
+
+            // 对齐原版 Dumpable 的倒空时长
+            // Match vanilla Dumpable's empty duration.
+            this.SetWorkTime(1f);
+
             Subscribe(493375141, OnRefreshUserMenuDelegate);
             Subscribe(-111137758, OnRefreshUserMenuDelegate);
             Subscribe(-790448070, OnDeconstructDelegate);
@@ -311,15 +350,287 @@ namespace MoveThisHere
             base.OnSpawn();
 
         }
-        public void OnDeconstruct()
-        {
 
+        protected override void OnStartWork(WorkerBase worker)
+        {
+            base.OnStartWork(worker);
+            workElapsedTime = 0f;
+
+            // 小人到场开始工作，撤下"待拆除"状态图标
+            // Vanilla Deconstructable.OnStartWork 也做这一步
+            base.GetComponent<KSelectable>().RemoveStatusItem(Db.Get().BuildingStatusItems.PendingDeconstruction, false);
+            base.Trigger(1830962028, this);
+        }
+
+        // multitoolContext = "build" 下 Workable 的完成判定不靠 workTime，而是等 multitool 系统发信号。
+        // 本建筑没有配全 multitool 那套参数，信号永远不来，所以这里自己累计时间并返回 true。
+        // Under multitoolContext = "build", Workable does not complete based on workTime; it waits for a signal
+        // from the multitool system. This building does not have the full multitool parameter set, so the signal
+        // never arrives. Accumulate time here and return true to finish.
+        protected override bool OnWorkTick(WorkerBase worker, float dt)
+        {
+            workElapsedTime += dt;
+            if (workElapsedTime >= this.workTime)
+            {
+                return true;
+            }
+            return false;
+        }
+
+        protected override void OnCompleteWork(WorkerBase worker)
+        {
+            base.OnCompleteWork(worker);
+
+            // 小人到场完成工作：清状态、释放优先级引用、执行拆除
+            // Duplicant finished the work: clear state, release priority ref, do the deconstruct.
+            deconstructChore = null;
+            workElapsedTime = 0f;
+            if (isMarkedForDeconstruction)
+            {
+                isMarkedForDeconstruction = false;
+                Prioritizable.RemoveRef(base.gameObject);
+            }
+            DoDeconstruct();
+        }
+
+        protected override void OnCleanUp()
+        {
+            // 建筑被其他途径销毁（如加载存档、强制删除）时清理未完成的任务
+            // Clean up any pending chore when the building is destroyed by other means (save load, force delete).
+            CancelDeconstruction();
+            base.OnCleanUp();
+        }
+
+        // 手动拆除入口：按钮和原版拆除事件都走这里
+        //
+        // 判断流程：
+        //   1. 已排队 → 取消
+        //   2. 先释放箱内非液体/气体的物品（"先释放其他"）
+        //   3. 若箱内已无可倾倒的液体/气体，或不允许倾倒 → 瞬间拆除
+        //   4. 否则（允许倾倒 + 箱内确有液体/气体）→ 排队小人任务
+        //      小人到场完成后，DoDeconstruct 再处理剩下的液体/气体（"再慢慢处理气体液体"）
+        //
+        // Manual deconstruct entry point: both the button and the vanilla deconstruct event go through here.
+        //
+        // Flow:
+        //   1. Already queued -> cancel
+        //   2. Drop non-liquid/gas items first ("drop the rest first")
+        //   3. No spillable liquid/gas left, or willSpill is off -> instant deconstruct
+        //   4. Otherwise (willSpill on + liquid/gas present) -> queue a duplicant chore
+        //      Once the duplicant finishes, DoDeconstruct handles the remaining liquid/gas ("then slowly handle the liquid/gas")
+        public void RequestDeconstruct()
+        {
+            if (isMarkedForDeconstruction)
+            {
+                CancelDeconstruction();
+                return;
+            }
+
+            HaulingPoint haulingPoint = base.GetComponent<HaulingPoint>();
+            if (haulingPoint == null)
+            {
+                DoDeconstruct();
+                return;
+            }
+
+            // 先释放其他（非液体/气体的固体等），顺便确认箱内是否还有可倾倒物
+            // Drop the rest first, and while we're at it, find out whether any spillable liquid/gas remains.
+            bool hasSpillable = DropNonSpillableAndCheckRemaining();
+
+            // 无人能倒或倒不出去 → 瞬间拆除
+            if (!haulingPoint.willSpill || !hasSpillable)
+            {
+                DoDeconstruct();
+                return;
+            }
+
+            StartDeconstructChore();
+        }
+
+        // 创建小人拆除任务，并挂上"待拆除"状态图标 / 刷新菜单为"取消拆除"
+        // Create the duplicant deconstruct chore, attach the "pending deconstruction" status item,
+        // and refresh the menu to show "Cancel Remove".
+        private void StartDeconstructChore()
+        {
+            isMarkedForDeconstruction = true;
+            // 原版 Deconstructable / Dumpable 都在创建 chore 前 AddRef，缺失会导致 chore 无法被正常调度
+            // Vanilla Deconstructable / Dumpable both AddRef before creating the chore; without it the chore will not be scheduled properly.
+            Prioritizable.AddRef(base.gameObject);
+            deconstructChore = new WorkChore<DeconstructableHaulingPoint>(
+                Db.Get().ChoreTypes.Deconstruct,
+                this,
+                null,
+                true,
+                null,
+                null,
+                null,
+                true,
+                null,
+                false,
+                true,
+                null,
+                true,
+                true,
+                true,
+                PriorityScreen.PriorityClass.basic,
+                5,
+                false,
+                true);
+
+            // 挂上"待拆除"状态图标（原版 Deconstructable.QueueDeconstruction 也这么做）
+            // iconName = "status_item_pending_deconstruction"
+            base.GetComponent<KSelectable>().AddStatusItem(Db.Get().BuildingStatusItems.PendingDeconstruction, this);
+            base.Trigger(2108245096, "Deconstruct");
+
+            // 刷新用户菜单，使按钮显示为"取消拆除"
+            Game.Instance.userMenu.Refresh(base.gameObject);
+        }
+
+        // 取消已排队的手动拆除任务
+        // Cancel a queued manual deconstruction.
+        public void CancelDeconstruction()
+        {
+            bool wasQueued = isMarkedForDeconstruction || deconstructChore != null;
+            if (!wasQueued)
+            {
+                // 没排过队，什么都不用做；也避免 OnCleanUp 里对正在删除的对象刷新菜单
+                return;
+            }
+
+            if (deconstructChore != null)
+            {
+                deconstructChore.Cancel("Cancelled deconstruction");
+                deconstructChore = null;
+
+                // 撤下"待拆除"状态图标（对齐原版 Deconstructable.CancelDeconstruction）
+                base.GetComponent<KSelectable>().RemoveStatusItem(Db.Get().BuildingStatusItems.PendingDeconstruction, false);
+            }
+            if (isMarkedForDeconstruction)
+            {
+                isMarkedForDeconstruction = false;
+                Prioritizable.RemoveRef(base.gameObject);
+            }
+            workElapsedTime = 0f;
+
+            // 刷新用户菜单，使按钮显示为"拆除"
+            Game.Instance.userMenu.Refresh(base.gameObject);
+        }
+
+        // 重新评估已排队的任务：条件不再满足（不再需要小人）则取消任务并立即拆除
+        // Re-evaluate a queued chore: if the condition is no longer met (no duplicant needed), cancel and deconstruct instantly.
+        public void ReevaluateQueuedDeconstruction()
+        {
+            if (!isMarkedForDeconstruction) return;
+
+            HaulingPoint haulingPoint = base.GetComponent<HaulingPoint>();
+            if (haulingPoint == null || !haulingPoint.willSpill || !HasSpillableContent())
+            {
+                CancelDeconstruction();
+                DoDeconstruct();
+            }
+        }
+
+        // 瞬间拆除：自动拆除（存储满）时调用，不经过小人
+        // 按真值表：自动拆除始终瞬间，不做"先释放其他"的分步处理，DropAll 一次性处理所有物品
+        //
+        // Instant deconstruct: called by auto-deconstruct (storage full); bypasses the duplicant.
+        // Per the truth table: auto-deconstruct is always instant, no staged "drop the rest first" handling;
+        // DropAll handles everything in one shot.
+        public void InstantDeconstruct()
+        {
+            CancelDeconstruction();
+            DoDeconstruct();
+        }
+
+        // 实际拆除逻辑，只在 DoDeconstruct / OnCompleteWork 里执行
+        // 走小人任务路径时，非液体/气体物品已在 RequestDeconstruct 里先掉出，
+        // 所以这里的 DropAll 实际只处理剩下的液体/气体。
+        //
+        // Actual deconstruct logic; only executed from DoDeconstruct / OnCompleteWork.
+        // When going through the duplicant chore, non-liquid/gas items were already dropped
+        // in RequestDeconstruct, so DropAll here effectively only handles the remaining liquid/gas.
+        private void DoDeconstruct()
+        {
             Storage storage = base.GetComponent<Storage>();
             HaulingPoint haulingPoint = base.GetComponent<HaulingPoint>();
 
-            storage.DropAll(haulingPoint.willSpill, haulingPoint.willSpill); //drop liquids and gasses based on setting
+            if (storage != null && haulingPoint != null)
+            {
+                storage.DropAll(haulingPoint.willSpill, haulingPoint.willSpill); //drop liquids and gasses based on setting
+            }
 
             base.gameObject.DeleteObject(); //goodbye
+        }
+
+        // 把箱内物品分流：可倾倒的（液体/气体 + Dumpable）留下，其余立刻掉出。
+        // 返回箱内是否还有可倾倒物，省掉一次额外遍历。
+        //
+        // Split storage contents: spillable items (liquid/gas + Dumpable) are kept; everything else is dropped now.
+        // Returns whether any spillable content remains, saving an extra iteration.
+        private bool DropNonSpillableAndCheckRemaining()
+        {
+            Storage storage = base.GetComponent<Storage>();
+            if (storage == null) return false;
+
+            // 先收集再统一 Drop，避免遍历 storage.items 时因 Drop 修改列表而出错
+            // Collect first, then Drop, to avoid modifying storage.items while iterating.
+            List<GameObject> toDrop = null;
+            bool hasSpillable = false;
+
+            foreach (GameObject item in storage.items)
+            {
+                if (item == null) continue;
+
+                if (IsSpillable(item))
+                {
+                    hasSpillable = true;
+                }
+                else
+                {
+                    if (toDrop == null) toDrop = new List<GameObject>();
+                    toDrop.Add(item);
+                }
+            }
+
+            if (toDrop != null)
+            {
+                foreach (GameObject item in toDrop)
+                {
+                    storage.Drop(item, true);
+                }
+            }
+
+            return hasSpillable;
+        }
+
+        // 箱内是否有可倾倒的液体或气体（对齐原版 Storage.DropSome 的判定）
+        // 只有它们才需要"倾倒"这个动作，也才需要小人到场
+        //
+        // Whether the storage contains dumpable liquid or gas (aligned with vanilla Storage.DropSome).
+        // Only these need the "dump" action, hence only these need a duplicant to be present.
+        private bool HasSpillableContent()
+        {
+            Storage storage = base.GetComponent<Storage>();
+            if (storage == null) return false;
+
+            foreach (GameObject item in storage.items)
+            {
+                if (IsSpillable(item)) return true;
+            }
+            return false;
+        }
+
+        // 单项判定：必须带 Dumpable 组件，且 PrimaryElement.Element 是液体或气体
+        // Per-item check: must have a Dumpable component, and its PrimaryElement.Element must be liquid or gas.
+        private static bool IsSpillable(GameObject item)
+        {
+            if (item == null) return false;
+            // 必须有 Dumpable 组件才能倾倒，与 Storage.DropSome 一致
+            // Must have a Dumpable component to be dumped, same as Storage.DropSome.
+            if (item.GetComponent<Dumpable>() == null) return false;
+            PrimaryElement pe = item.GetComponent<PrimaryElement>();
+            if (pe == null || pe.Element == null) return false;
+            return pe.Element.IsLiquid || pe.Element.IsGas;
         }
 
 
@@ -327,13 +638,27 @@ namespace MoveThisHere
         {
             if (!this.HasTag(GameTags.Stored))
             {
-                KIconButtonMenu.ButtonInfo button = new KIconButtonMenu.ButtonInfo(
-                    "action_deconstruct",
-                    STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.REMOVE,
-                    OnDeconstruct,
-                    Action.NumActions,
-                    null, null, null,
-                    STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.REMOVE_TOOLTIP);
+                KIconButtonMenu.ButtonInfo button;
+                if (isMarkedForDeconstruction)
+                {
+                    button = new KIconButtonMenu.ButtonInfo(
+                        "action_deconstruct",
+                        STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE,
+                        RequestDeconstruct,
+                        Action.NumActions,
+                        null, null, null,
+                        STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.CANCEL_REMOVE_TOOLTIP);
+                }
+                else
+                {
+                    button = new KIconButtonMenu.ButtonInfo(
+                        "action_deconstruct",
+                        STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.REMOVE,
+                        RequestDeconstruct,
+                        Action.NumActions,
+                        null, null, null,
+                        STRINGS.BUILDINGS.BUTTONS.HAULINGPOINT.REMOVE_TOOLTIP);
+                }
                 Game.Instance.userMenu.AddButton(base.gameObject, button, 0f);
                 //add deconstruct button
                 //I thought about using cancel tool instead, but since it is made through build menu I thought this would be more intuivitive
@@ -343,8 +668,7 @@ namespace MoveThisHere
 
 
     }
-
-
+	
     public class FilteredStorageHaulingPoint
     {
         //this class is basically a copy of filteredstorage with just a few changes necessary to make hauling points work properly
